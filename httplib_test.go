@@ -2,6 +2,7 @@ package httplibrary
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -42,6 +43,9 @@ func TestPostRequest(t *testing.T) {
 	rb.WithTimeout(5)
 	rb.WithRateLimter(5, 3)
 
+	var wg sync.WaitGroup
+
+	///make 10 requests
 	for i := 0; i < 10; i++ {
 		apiRequest := ApiRequest{
 			Title:  "Go HTTP Client",
@@ -50,23 +54,28 @@ func TestPostRequest(t *testing.T) {
 		}
 
 		rb.WithJsonData(apiRequest)
+		wg.Add(1)
+		go func(wg *sync.WaitGroup) {
+			res, err := rb.Send()
 
-		res, err := rb.Send()
+			if err != nil {
+				fmt.Printf("err: %s", err)
+				wg.Done()
+				return
+			}
+			//fmt.Println("res", res)
 
-		if err != nil {
-			fmt.Printf("err: %s", err)
-		}
+			var apiResponse ApiResponse
 
-		//fmt.Println("res", res)
+			err = rb.ReadJsonBody(res, &apiResponse)
 
-		var apiResponse ApiResponse
+			if err != nil {
+				fmt.Printf("err: %s", err)
+			}
 
-		err = rb.ReadJsonBody(res, &apiResponse)
-
-		if err != nil {
-			fmt.Printf("err: %s", err)
-		}
-
-		fmt.Println("Title:", res.Status, "UserId:", apiResponse.UserId)
+			fmt.Println("Title:", res.Status, "UserId:", apiResponse.UserId)
+			defer wg.Done()
+		}(&wg)
+		wg.Wait()
 	}
 }

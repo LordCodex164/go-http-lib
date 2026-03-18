@@ -8,7 +8,11 @@ import (
 	"io"
 	"math"
 	"math/rand/v2"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
+	"os"
+	"path/filepath"
 
 	//"sync"
 	"time"
@@ -38,6 +42,7 @@ type RequestBuilder struct {
 	client		*http.Client
 	middlewares  []Middleware
 	limiter      *rate.Limiter
+	cookie       *http.Cookie
 }
 
 type RequestError struct {
@@ -46,11 +51,15 @@ type RequestError struct {
 }
 
 type UnmarshalError struct {
-	Err           error
+	Err       error
 }
 
 type MarshalError struct {
-	Err           error
+	Err       error
+}
+
+type RateLimitError struct {
+	Err      error
 }
 
 
@@ -66,6 +75,10 @@ func (re *MarshalError) Error() string {
 	return fmt.Sprintf("httplib unmarshal error: %v", re.Err)
 }
 
+func(rateLimitErr *RateLimitError) Error() string {
+	return fmt.Sprintf("rate limit error: %v", rateLimitErr.Err)
+}
+
 var defaultTransport = &http.Transport{
 	MaxIdleConns: 5,
 	IdleConnTimeout: 5 * time.Second,
@@ -79,6 +92,7 @@ func NewRequestBuilder(method, url string) *RequestBuilder {
 		timeout: 3 * time.Second,
 		retries:  3,
 		client: &http.Client{Transport: defaultTransport},
+		cookie: &http.Cookie{Name: "cookie_token", Value: ""},
 	}
 }
 
@@ -88,6 +102,11 @@ type Backoff func(retry int) time.Duration
 
 func (rb *RequestBuilder) WithHeader(key, value string) *RequestBuilder {
 	rb.headers[key] = value
+	return rb
+}
+
+func (rb *RequestBuilder) WithCookie(cookie *http.Cookie) *RequestBuilder {
+	rb.cookie = cookie
 	return rb
 }
 
@@ -146,6 +165,13 @@ func (rb *RequestBuilder) Send() (*http.Response, error) {
 	if rb.limiter != nil {
 		fmt.Println("limiter exists")
 		rb.limiter.Wait(context.Background())
+		isAllow := rb.limiter.Allow()
+		if isAllow {
+			fmt.Println("event allowed")
+		} else {
+			err := fmt.Errorf("rate limit exceeded\n")
+			return nil, &RateLimitError{Err: err}
+		}
 	}
 
 	req, err := http.NewRequest(rb.method, rb.url, rb.body)
@@ -167,6 +193,8 @@ func (rb *RequestBuilder) Send() (*http.Response, error) {
 		}
 	}
 
+	// if !rb.client.Timeout 
+
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +205,7 @@ func (rb *RequestBuilder) Send() (*http.Response, error) {
 
 func (rb *RequestBuilder) WithTimeout(timeout time.Duration) *RequestBuilder {
 	rb.timeout = timeout
-	return rb 
+	return rb
 }
 
 func (rb *RequestBuilder) SendAsync() <- chan ApiResponse {
@@ -200,26 +228,66 @@ func (rb *RequestBuilder) SendAsync() <- chan ApiResponse {
 
 func ExponentialBackoff(retry int) time.Duration {
 	baseDelay := time.Millisecond * 100
-	maxDelay := 10 * time.Second
-	factor := 2.0
 	jitter := 0.2
+	factor := 2.0 
+	maxDelay := 10 * time.Second
 
-	//we start at 100
 	delay := float64(baseDelay) * math.Pow(factor, float64(retry))
 
-	if delay > float64(maxDelay) {
+	if delay > float64(maxDelay){
 		delay = float64(maxDelay)
 	}
-
-	//20
+	
 	jitterRange := jitter * delay
 
-	//100 - 10
 	delay -= jitterRange/2
+
 	delay += rand.Float64() * delay
 
 	return time.Duration(delay)
 
+
+}
+
+// WithFile adds a file to the request as a multipart form data
+func (rb *RequestBuilder) WithFile(fieldName, filePath string) (*RequestBuilder, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", `form-data; name="`+fieldName+`"; filename="`+filepath.Base(fileInfo.Name())+`"`)
+	h.Set("Content-Type", "application/octet-stream")
+
+	part, err := writer.CreatePart(h)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = io.Copy(part, file)
+	if err != nil {
+		return nil, err
+	}
+
+	err = writer.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	rb.body = body
+	rb.headers["Content-Type"] = writer.FormDataContentType()
+
+	return rb, nil
 }
 
 func RetryTracker() {
